@@ -44,6 +44,13 @@ def _only_digits(value: str) -> str:
     return re.sub(r"\D", "", value or "")
 
 
+def _first_non_empty(*values):
+    for value in values:
+        if value:
+            return value
+    return ""
+
+
 def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
     queries = []
 
@@ -135,7 +142,8 @@ def _request_places(query: str, max_result_count: int = 10) -> List[Dict[str, An
             "places.primaryType",
             "places.primaryTypeDisplayName",
             "places.location",
-            "places.shortFormattedAddress"
+            "places.shortFormattedAddress",
+            "places.photos",
         ])
     }
 
@@ -192,6 +200,44 @@ def _enrich_from_website(website_url: str) -> Dict[str, Any]:
         pass
 
     return info
+
+
+def _get_place_photo(place: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pega 1 foto do Maps usando Place Photos (New).
+    Retorna photoUri e attributions quando houver.
+    """
+    result = {
+        "foto_maps_url": "",
+        "foto_maps_atribuicoes": [],
+    }
+
+    photos = place.get("photos") or []
+    if not photos:
+        return result
+
+    first_photo = photos[0]
+    photo_name = first_photo.get("name", "")
+    author_attributions = first_photo.get("authorAttributions", []) or []
+
+    if not photo_name or not GOOGLE_API_KEY:
+        result["foto_maps_atribuicoes"] = author_attributions
+        return result
+
+    try:
+        photo_url = (
+            f"https://places.googleapis.com/v1/{photo_name}/media"
+            f"?key={GOOGLE_API_KEY}&maxWidthPx=600&skipHttpRedirect=true"
+        )
+        resp = requests.get(photo_url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code < 400:
+            data = resp.json()
+            result["foto_maps_url"] = data.get("photoUri", "")
+            result["foto_maps_atribuicoes"] = author_attributions
+    except Exception:
+        pass
+
+    return result
 
 
 def _classify_company(place: Dict[str, Any], cnpj_base_data: Dict[str, Any]) -> str:
@@ -253,29 +299,34 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         cnpj_base_data = enrich_from_cnpj_base(cnpj_digits)
         cnpjbiz_data = enrich_from_cnpjbiz(cnpj_digits)
 
-    email_final = (
-        website_info.get("email")
-        or cnpjbiz_data.get("cnpjbiz_email", "")
-        or ""
+    email_final = _first_non_empty(
+        website_info.get("email"),
+        cnpjbiz_data.get("cnpjbiz_email", "")
     )
 
-    whatsapp_final = (
-        website_info.get("whatsapp")
-        or cnpjbiz_data.get("cnpjbiz_whatsapp", "")
-        or ""
+    whatsapp_final = _first_non_empty(
+        website_info.get("whatsapp"),
+        cnpjbiz_data.get("cnpjbiz_whatsapp", "")
     )
 
-    telefone_final = (
-        phone
-        or cnpjbiz_data.get("cnpjbiz_telefone", "")
-        or ""
+    telefone_final = _first_non_empty(
+        phone,
+        cnpjbiz_data.get("cnpjbiz_telefone", "")
     )
+
+    foto_maps = _get_place_photo(place)
 
     lead = {
         "id": _safe_get(place, "id", default=""),
         "nome": _safe_get(place, "displayName", "text", default="") or "Sem nome",
-        "razao_social": cnpj_base_data.get("razao_social", "") or cnpjbiz_data.get("cnpjbiz_razao_social", ""),
-        "nome_fantasia": cnpj_base_data.get("nome_fantasia", "") or cnpjbiz_data.get("cnpjbiz_nome_fantasia", ""),
+        "razao_social": _first_non_empty(
+            cnpj_base_data.get("razao_social", ""),
+            cnpjbiz_data.get("cnpjbiz_razao_social", "")
+        ),
+        "nome_fantasia": _first_non_empty(
+            cnpj_base_data.get("nome_fantasia", ""),
+            cnpjbiz_data.get("cnpjbiz_nome_fantasia", "")
+        ),
         "endereco": _safe_get(place, "formattedAddress", default="") or "",
         "endereco_curto": _safe_get(place, "shortFormattedAddress", default="") or "",
         "cidade": cidade,
@@ -293,16 +344,39 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         "status_empresa": _safe_get(place, "businessStatus", default="") or "",
         "palavra_chave": palavra_chave_principal,
         "lead_score": 0,
-        "situacao_cadastral": cnpj_base_data.get("situacao_cadastral", "") or cnpjbiz_data.get("cnpjbiz_situacao_cadastral", ""),
-        "data_abertura": cnpj_base_data.get("data_abertura", ""),
-        "cnae_principal": cnpj_base_data.get("cnae_principal", "") or cnpjbiz_data.get("cnpjbiz_cnae_principal", ""),
-        "porte": cnpj_base_data.get("porte", ""),
-        "natureza_juridica": cnpj_base_data.get("natureza_juridica", ""),
-        "capital_social": cnpj_base_data.get("capital_social", "") or cnpjbiz_data.get("cnpjbiz_capital_social", ""),
-        "matriz_filial": cnpj_base_data.get("matriz_filial", ""),
+        "situacao_cadastral": _first_non_empty(
+            cnpj_base_data.get("situacao_cadastral", ""),
+            cnpjbiz_data.get("cnpjbiz_situacao_cadastral", "")
+        ),
+        "data_abertura": _first_non_empty(
+            cnpj_base_data.get("data_abertura", ""),
+            cnpjbiz_data.get("cnpjbiz_data_abertura", "")
+        ),
+        "cnae_principal": _first_non_empty(
+            cnpj_base_data.get("cnae_principal", ""),
+            cnpjbiz_data.get("cnpjbiz_cnae_principal", "")
+        ),
+        "porte": _first_non_empty(
+            cnpj_base_data.get("porte", ""),
+            cnpjbiz_data.get("cnpjbiz_porte", "")
+        ),
+        "natureza_juridica": _first_non_empty(
+            cnpj_base_data.get("natureza_juridica", ""),
+            cnpjbiz_data.get("cnpjbiz_natureza_juridica", "")
+        ),
+        "capital_social": _first_non_empty(
+            cnpj_base_data.get("capital_social", ""),
+            cnpjbiz_data.get("cnpjbiz_capital_social", "")
+        ),
+        "matriz_filial": _first_non_empty(
+            cnpj_base_data.get("matriz_filial", ""),
+            cnpjbiz_data.get("cnpjbiz_matriz_filial", "")
+        ),
         "uf": cnpj_base_data.get("uf", ""),
         "municipio": cnpj_base_data.get("municipio", ""),
         "cnpjbiz_url": cnpjbiz_data.get("cnpjbiz_url", ""),
+        "foto_maps_url": foto_maps.get("foto_maps_url", ""),
+        "foto_maps_atribuicoes": foto_maps.get("foto_maps_atribuicoes", []),
     }
 
     lead["tipo_empresa"] = _classify_company(place, cnpj_base_data)
@@ -312,9 +386,6 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
 
 
 def _city_matches(cidade_busca: str, endereco: str) -> bool:
-    """
-    Evita resultados fora da cidade real.
-    """
     if not cidade_busca or not endereco:
         return True
 
