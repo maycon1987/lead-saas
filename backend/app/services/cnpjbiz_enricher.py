@@ -44,11 +44,32 @@ def _extract_whatsapp(text: str) -> str:
     return m.group(1) if m else ""
 
 
+def _clean_value(value: str) -> str:
+    if not value:
+        return ""
+    value = re.sub(r"\s+", " ", value).strip(" :-\n\t")
+    return value
+
+
+def _extract_labeled_value(text: str, labels: list[str], max_len: int = 140) -> str:
+    if not text:
+        return ""
+
+    for label in labels:
+        patterns = [
+            rf"{label}\s*[:\-]?\s*(.+)",
+            rf"{label}\s*\n\s*(.+)",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                value = _clean_value(m.group(1))
+                if value:
+                    return value[:max_len]
+    return ""
+
+
 def enrich_from_cnpj_base(cnpj: str) -> Dict[str, Any]:
-    """
-    Busca dados cadastrais públicos por CNPJ.
-    Usa BrasilAPI como padrão, mas pode usar outra base via env.
-    """
     result = {
         "cnpj": cnpj,
         "razao_social": "",
@@ -91,15 +112,17 @@ def enrich_from_cnpj_base(cnpj: str) -> Dict[str, Any]:
         result["uf"] = data.get("uf") or ""
         result["municipio"] = data.get("municipio") or ""
 
-        cnaes = data.get("cnaes_secundarios") or data.get("cnae_fiscal_descricao") or ""
-        if isinstance(cnaes, list) and cnaes:
-            primeiro = cnaes[0]
-            if isinstance(primeiro, dict):
-                result["cnae_principal"] = primeiro.get("descricao") or ""
-            else:
-                result["cnae_principal"] = str(primeiro)
-        elif isinstance(cnaes, str):
-            result["cnae_principal"] = cnaes
+        cnae_desc = data.get("cnae_fiscal_descricao") or ""
+        if cnae_desc:
+            result["cnae_principal"] = cnae_desc
+        else:
+            cnaes = data.get("cnaes_secundarios") or []
+            if isinstance(cnaes, list) and cnaes:
+                primeiro = cnaes[0]
+                if isinstance(primeiro, dict):
+                    result["cnae_principal"] = primeiro.get("descricao") or ""
+                else:
+                    result["cnae_principal"] = str(primeiro)
 
     except Exception:
         pass
@@ -108,10 +131,6 @@ def enrich_from_cnpj_base(cnpj: str) -> Dict[str, Any]:
 
 
 def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
-    """
-    Tenta abrir a página do cnpj.biz e clicar em botões que revelem contato.
-    Como o site pode mudar, essa rotina usa seletores genéricos e fallback por texto.
-    """
     result = {
         "cnpjbiz_url": "",
         "cnpjbiz_email": "",
@@ -121,7 +140,11 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
         "cnpjbiz_nome_fantasia": "",
         "cnpjbiz_capital_social": "",
         "cnpjbiz_situacao_cadastral": "",
+        "cnpjbiz_data_abertura": "",
         "cnpjbiz_cnae_principal": "",
+        "cnpjbiz_porte": "",
+        "cnpjbiz_natureza_juridica": "",
+        "cnpjbiz_matriz_filial": "",
     }
 
     if not CNPJBIZ_ENABLED:
@@ -139,9 +162,9 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
             browser = p.chromium.launch(headless=CNPJBIZ_HEADLESS)
             page = browser.new_page()
             page.goto(url, timeout=REQUEST_TIMEOUT * 1000)
-            page.wait_for_timeout(3000)
+            page.wait_for_timeout(3500)
 
-            # tenta clicar em possíveis botões de revelar contato
+            # tenta clicar em botões que revelem contato
             textos_possiveis = [
                 "mostrar telefone",
                 "ver telefone",
@@ -153,14 +176,16 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
                 "ver email",
                 "e-mail",
                 "email",
+                "mostrar contato",
+                "ver contato",
             ]
 
             for texto in textos_possiveis:
                 try:
                     locator = page.get_by_text(texto, exact=False)
                     if locator.count() > 0:
-                        locator.first.click(timeout=2000)
-                        page.wait_for_timeout(1200)
+                        locator.first.click(timeout=1500)
+                        page.wait_for_timeout(900)
                 except Exception:
                     pass
 
@@ -171,21 +196,33 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
             result["cnpjbiz_telefone"] = _extract_phone(texto) or _extract_phone(html)
             result["cnpjbiz_whatsapp"] = _extract_whatsapp(texto) or _extract_whatsapp(html)
 
-            # tentativa simples de capturar alguns campos textuais
-            for label, key in [
-                ("Razão Social", "cnpjbiz_razao_social"),
-                ("Nome Fantasia", "cnpjbiz_nome_fantasia"),
-                ("Capital Social", "cnpjbiz_capital_social"),
-                ("Situação Cadastral", "cnpjbiz_situacao_cadastral"),
-                ("CNAE Principal", "cnpjbiz_cnae_principal"),
-            ]:
-                try:
-                    m = re.search(rf"{label}\s*([\s\S]{{0,80}})", texto, re.IGNORECASE)
-                    if m:
-                        value = m.group(1).split("\n")[0].strip(" :-")
-                        result[key] = value
-                except Exception:
-                    pass
+            result["cnpjbiz_razao_social"] = _extract_labeled_value(
+                texto, ["Razão Social", "Razao Social"]
+            )
+            result["cnpjbiz_nome_fantasia"] = _extract_labeled_value(
+                texto, ["Nome Fantasia"]
+            )
+            result["cnpjbiz_capital_social"] = _extract_labeled_value(
+                texto, ["Capital Social"]
+            )
+            result["cnpjbiz_situacao_cadastral"] = _extract_labeled_value(
+                texto, ["Situação Cadastral", "Situacao Cadastral"]
+            )
+            result["cnpjbiz_data_abertura"] = _extract_labeled_value(
+                texto, ["Data de Abertura", "Início de Atividade", "Inicio de Atividade"]
+            )
+            result["cnpjbiz_cnae_principal"] = _extract_labeled_value(
+                texto, ["CNAE Principal"]
+            )
+            result["cnpjbiz_porte"] = _extract_labeled_value(
+                texto, ["Porte"]
+            )
+            result["cnpjbiz_natureza_juridica"] = _extract_labeled_value(
+                texto, ["Natureza Jurídica", "Natureza Juridica"]
+            )
+            result["cnpjbiz_matriz_filial"] = _extract_labeled_value(
+                texto, ["Matriz ou Filial", "Matriz/Filial", "Identificador Matriz Filial"]
+            )
 
             browser.close()
 
