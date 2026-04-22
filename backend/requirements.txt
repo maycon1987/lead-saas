@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+pandas
+openpyxl
+requests
+python-docx
+beautifulsoup4
+unidecode
+playwright
+pymupdf
+python-multipart
