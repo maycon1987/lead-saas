@@ -1,6 +1,6 @@
 import os
 import re
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -19,29 +19,27 @@ def only_digits(value: str) -> str:
     return re.sub(r"\D", "", value or "")
 
 
-def _extract_email(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r'([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})', text)
-    return m.group(1) if m else ""
+def validar_cnpj(cnpj: str) -> bool:
+    cnpj = only_digits(cnpj)
 
+    if len(cnpj) != 14:
+        return False
 
-def _extract_phone(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r'(\(?\d{2}\)?\s?\d{4,5}\-?\d{4})', text)
-    return m.group(1) if m else ""
+    if cnpj == cnpj[0] * 14:
+        return False
 
+    def calc_digito(cnpj_parcial: str, pesos):
+        soma = sum(int(num) * peso for num, peso in zip(cnpj_parcial, pesos))
+        resto = soma % 11
+        return "0" if resto < 2 else str(11 - resto)
 
-def _extract_whatsapp(text: str) -> str:
-    if not text:
-        return ""
-    wa = re.search(r'(https?://wa\.me/\d+)', text, re.IGNORECASE)
-    if wa:
-        return wa.group(1)
+    pesos1 = [5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    pesos2 = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
 
-    m = re.search(r'(\+?55\s?\(?\d{2}\)?\s?\d{4,5}\-?\d{4})', text)
-    return m.group(1) if m else ""
+    digito1 = calc_digito(cnpj[:12], pesos1)
+    digito2 = calc_digito(cnpj[:12] + digito1, pesos2)
+
+    return cnpj[-2:] == digito1 + digito2
 
 
 def _clean_value(value: str) -> str:
@@ -51,7 +49,32 @@ def _clean_value(value: str) -> str:
     return value
 
 
-def _extract_labeled_value(text: str, labels: list[str], max_len: int = 140) -> str:
+def _extract_email(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", text)
+    return m.group(1) if m else ""
+
+
+def _extract_phone(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(\(?\d{2}\)?\s?\d{4,5}\-?\d{4})", text)
+    return m.group(1) if m else ""
+
+
+def _extract_whatsapp(text: str) -> str:
+    if not text:
+        return ""
+    wa = re.search(r"(https?://wa\.me/\d+)", text, re.IGNORECASE)
+    if wa:
+        return wa.group(1)
+
+    m = re.search(r"(\+?55\s?\(?\d{2}\)?\s?\d{4,5}\-?\d{4})", text)
+    return m.group(1) if m else ""
+
+
+def _extract_labeled_value(text: str, labels: list[str], max_len: int = 180) -> str:
     if not text:
         return ""
 
@@ -71,7 +94,8 @@ def _extract_labeled_value(text: str, labels: list[str], max_len: int = 140) -> 
 
 def enrich_from_cnpj_base(cnpj: str) -> Dict[str, Any]:
     result = {
-        "cnpj": cnpj,
+        "cnpj": "",
+        "cnpj_valido": False,
         "razao_social": "",
         "nome_fantasia": "",
         "situacao_cadastral": "",
@@ -86,7 +110,10 @@ def enrich_from_cnpj_base(cnpj: str) -> Dict[str, Any]:
     }
 
     cnpj = only_digits(cnpj)
-    if len(cnpj) != 14:
+    result["cnpj"] = cnpj
+    result["cnpj_valido"] = validar_cnpj(cnpj)
+
+    if not result["cnpj_valido"]:
         return result
 
     url = f"{CNPJ_BASE_API_URL.rstrip('/')}/{cnpj}"
@@ -145,13 +172,16 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
         "cnpjbiz_porte": "",
         "cnpjbiz_natureza_juridica": "",
         "cnpjbiz_matriz_filial": "",
+        "cnpjbiz_cnpj_valido": False,
     }
 
     if not CNPJBIZ_ENABLED:
         return result
 
     cnpj = only_digits(cnpj)
-    if len(cnpj) != 14:
+    result["cnpjbiz_cnpj_valido"] = validar_cnpj(cnpj)
+
+    if not result["cnpjbiz_cnpj_valido"]:
         return result
 
     url = f"{CNPJBIZ_BASE_URL.rstrip('/')}/{cnpj}"
@@ -162,9 +192,9 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
             browser = p.chromium.launch(headless=CNPJBIZ_HEADLESS)
             page = browser.new_page()
             page.goto(url, timeout=REQUEST_TIMEOUT * 1000)
-            page.wait_for_timeout(3500)
+            page.wait_for_timeout(4000)
 
-            # tenta clicar em botões que revelem contato
+            # tentativa de clicar em botões para revelar contato
             textos_possiveis = [
                 "mostrar telefone",
                 "ver telefone",
@@ -174,8 +204,8 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
                 "whatsapp",
                 "mostrar email",
                 "ver email",
-                "e-mail",
                 "email",
+                "e-mail",
                 "mostrar contato",
                 "ver contato",
             ]
@@ -189,8 +219,8 @@ def enrich_from_cnpjbiz(cnpj: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-            html = page.content()
             texto = page.inner_text("body")
+            html = page.content()
 
             result["cnpjbiz_email"] = _extract_email(texto) or _extract_email(html)
             result["cnpjbiz_telefone"] = _extract_phone(texto) or _extract_phone(html)
