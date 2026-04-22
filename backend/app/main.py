@@ -1,11 +1,28 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional, List, Dict, Any
+from typing import Optional
 
 from app.services.collector import run_search
 
-
 app = FastAPI(title="Buscador de Leads", version="1.0.0")
+
+# Libera o front do Lovable e também localhost/ngrok para testes
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://lovable.dev",
+        "https://*.lovable.dev",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "*"
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 class FiltrosBusca(BaseModel):
