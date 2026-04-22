@@ -1,199 +1,502 @@
 import os
-import requests
 import re
-from urllib.parse import quote_plus
+import time
+from typing import Any, Dict, List, Optional
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", 30))
+import requests
 
-CNPJ_API = os.getenv("CNPJ_BASE_API_URL", "https://brasilapi.com.br/api/cnpj/v1")
+from app.services.cnpjbiz_enricher import (
+    enrich_from_cnpj_base,
+    enrich_from_cnpjbiz,
+    validar_cnpj,
+)
 
-# =========================
-# UTILIDADES
-# =========================
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY", "")
+PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
-def limpar_texto(txt):
-    if not txt:
+
+def _safe_get(d: Dict[str, Any], *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+        if cur is None:
+            return default
+    return cur
+
+
+def _normalize_text(value: Optional[str]) -> str:
+    if not value:
         return ""
-    return re.sub(r"\s+", " ", txt).strip()
+    return re.sub(r"\s+", " ", value).strip()
 
-def extrair_email(texto):
-    emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", texto or "")
-    return emails[0] if emails else None
 
-def extrair_whatsapp(texto):
-    numeros = re.findall(r"\d{10,13}", texto or "")
-    return numeros[0] if numeros else None
+def _slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^a-z0-9\s\-]", "", text)
+    text = re.sub(r"\s+", "-", text)
+    return text
 
-# =========================
-# CLASSIFICAÇÃO INTELIGENTE
-# =========================
 
-def classificar_empresa(nome, cnae, descricao):
-    texto = f"{nome} {cnae} {descricao}".lower()
+def _only_digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
 
-    if "fabric" in texto:
+
+def _first_non_empty(*values):
+    for value in values:
+        if value:
+            return value
+    return ""
+
+
+def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
+    queries = []
+
+    cidade = _normalize_text(cidade)
+    principal = _normalize_text(principal)
+    extras = _normalize_text(extras)
+
+    if principal:
+        queries.append(f"{principal} em {cidade}")
+
+    if extras:
+        extras_list = [x.strip() for x in extras.split(",") if x.strip()]
+        for extra in extras_list:
+            queries.append(f"{principal} {extra} em {cidade}")
+            queries.append(f"{extra} em {cidade}")
+
+    queries.append(f"{principal} {cidade}")
+    queries.append(f"empresa de {principal} em {cidade}")
+    queries.append(f"loja de {principal} em {cidade}")
+
+    final = []
+    seen = set()
+    for q in queries:
+        key = q.lower()
+        if key not in seen:
+            seen.add(key)
+            final.append(q)
+
+    return final
+
+
+def _extract_instagram(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(https?://(?:www\.)?instagram\.com/[A-Za-z0-9._\-/?=&]+)", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _extract_facebook(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(https?://(?:www\.)?facebook\.com/[A-Za-z0-9._\-/?=&]+)", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _extract_whatsapp(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(https?://wa\.me/\d+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    m2 = re.search(r"(\+?55\s?\(?\d{2}\)?\s?\d{4,5}\-?\d{4})", text)
+    return m2.group(1) if m2 else ""
+
+
+def _extract_email(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", text)
+    return m.group(1) if m else ""
+
+
+def _extract_cnpj(text: str) -> str:
+    if not text:
+        return ""
+    matches = re.findall(r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}\-?\d{2}|\d{14})", text)
+    for m in matches:
+        digits = _only_digits(m)
+        if validar_cnpj(digits):
+            return digits
+    return ""
+
+
+def _request_places(query: str, max_result_count: int = 10) -> List[Dict[str, Any]]:
+    if not GOOGLE_API_KEY:
+        raise Exception("Variável GOOGLE_API_KEY não configurada no Railway.")
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": GOOGLE_API_KEY,
+        "X-Goog-FieldMask": ",".join([
+            "places.id",
+            "places.displayName",
+            "places.formattedAddress",
+            "places.nationalPhoneNumber",
+            "places.internationalPhoneNumber",
+            "places.websiteUri",
+            "places.googleMapsUri",
+            "places.rating",
+            "places.userRatingCount",
+            "places.businessStatus",
+            "places.primaryType",
+            "places.primaryTypeDisplayName",
+            "places.location",
+            "places.shortFormattedAddress",
+            "places.photos",
+        ])
+    }
+
+    payload = {
+        "textQuery": query,
+        "maxResultCount": max_result_count,
+        "languageCode": "pt-BR"
+    }
+
+    response = requests.post(
+        PLACES_TEXT_SEARCH_URL,
+        headers=headers,
+        json=payload,
+        timeout=REQUEST_TIMEOUT
+    )
+
+    if response.status_code >= 400:
+        raise Exception(f"Erro Google Places: {response.status_code} - {response.text}")
+
+    data = response.json()
+    return data.get("places", [])
+
+
+def _enrich_from_website(website_url: str) -> Dict[str, Any]:
+    info = {
+        "email": "",
+        "instagram": "",
+        "facebook": "",
+        "whatsapp": "",
+        "cnpj": "",
+    }
+
+    if not website_url:
+        return info
+
+    try:
+        resp = requests.get(
+            website_url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if resp.status_code >= 400:
+            return info
+
+        html = resp.text
+
+        info["email"] = _extract_email(html)
+        info["instagram"] = _extract_instagram(html)
+        info["facebook"] = _extract_facebook(html)
+        info["whatsapp"] = _extract_whatsapp(html)
+        info["cnpj"] = _extract_cnpj(html)
+
+    except Exception:
+        pass
+
+    return info
+
+
+def _get_place_photo(place: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        "foto_maps_url": "",
+        "foto_maps_atribuicoes": [],
+    }
+
+    photos = place.get("photos") or []
+    if not photos:
+        return result
+
+    first_photo = photos[0]
+    photo_name = first_photo.get("name", "")
+    author_attributions = first_photo.get("authorAttributions", []) or []
+
+    if not photo_name or not GOOGLE_API_KEY:
+        result["foto_maps_atribuicoes"] = author_attributions
+        return result
+
+    try:
+        photo_url = (
+            f"https://places.googleapis.com/v1/{photo_name}/media"
+            f"?key={GOOGLE_API_KEY}&maxWidthPx=600&skipHttpRedirect=true"
+        )
+        resp = requests.get(photo_url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code < 400:
+            data = resp.json()
+            result["foto_maps_url"] = data.get("photoUri", "")
+            result["foto_maps_atribuicoes"] = author_attributions
+    except Exception:
+        pass
+
+    return result
+
+
+def _classify_company(place: Dict[str, Any], cnpj_base_data: Dict[str, Any], cnpjbiz_data: Dict[str, Any]) -> str:
+    primary_type = (_safe_get(place, "primaryType") or "").lower()
+    primary_name = (_safe_get(place, "primaryTypeDisplayName", "text") or "").lower()
+
+    cnae = _first_non_empty(
+        cnpj_base_data.get("cnae_principal", ""),
+        cnpjbiz_data.get("cnpjbiz_cnae_principal", "")
+    ).lower()
+
+    joined = f"{primary_type} {primary_name} {cnae}"
+
+    if any(x in joined for x in ["manufacturer", "fabric", "factory", "fabrica", "industria"]):
         return "Fabricante"
-
-    if "atacad" in texto or "distrib" in texto:
-        return "Distribuidor / Atacadista"
-
-    if "import" in texto:
+    if any(x in joined for x in ["wholesale", "wholesaler", "distribution", "distributor", "atacado"]):
+        return "Distribuidor"
+    if any(x in joined for x in ["import", "importacao", "importação"]):
         return "Importador"
+    if any(x in joined for x in ["retail", "comercio", "loja", "varejo"]):
+        return "Revendedor"
+    return "Todos"
 
-    return "Revendedor"
 
-# =========================
-# GOOGLE PLACES
-# =========================
+def _calculate_score(lead: Dict[str, Any]) -> int:
+    score = 0
 
-def buscar_google_places(query):
-    url = f"https://maps.googleapis.com/maps/api/place/textsearch/json?query={quote_plus(query)}&key={GOOGLE_API_KEY}"
+    if lead.get("whatsapp"):
+        score += 20
+    if lead.get("instagram"):
+        score += 10
+    if lead.get("site"):
+        score += 15
+    if lead.get("email"):
+        score += 15
+    if lead.get("cnpj"):
+        score += 15
+    if lead.get("rating", 0) >= 4.0:
+        score += 10
+    if lead.get("reviews", 0) >= 10:
+        score += 10
+    if lead.get("status_empresa") == "OPERATIONAL":
+        score += 5
 
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT).json()
-        return resp.get("results", [])
-    except:
-        return []
+    return min(score, 100)
 
-def buscar_detalhes_place(place_id):
-    url = f"https://maps.googleapis.com/maps/api/place/details/json?place_id={place_id}&key={GOOGLE_API_KEY}"
 
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT).json()
-        return resp.get("result", {})
-    except:
-        return {}
+def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_principal: str) -> Dict[str, Any]:
+    website = _safe_get(place, "websiteUri", default="") or ""
+    website_info = _enrich_from_website(website) if website else {}
 
-def montar_foto(place):
-    if "photos" in place:
-        photo_ref = place["photos"][0]["photo_reference"]
-        return f"https://maps.googleapis.com/maps/api/place/photo?maxwidth=400&photo_reference={photo_ref}&key={GOOGLE_API_KEY}"
-    return None
+    phone = (
+        _safe_get(place, "nationalPhoneNumber")
+        or _safe_get(place, "internationalPhoneNumber")
+        or ""
+    )
 
-# =========================
-# CNPJ
-# =========================
+    cnpj = website_info.get("cnpj", "")
+    cnpj_digits = _only_digits(cnpj) if cnpj else ""
 
-def buscar_cnpj(cnpj):
-    if not cnpj:
-        return {}
+    cnpj_base_data = {}
+    cnpjbiz_data = {}
 
-    try:
-        url = f"{CNPJ_API}/{cnpj}"
-        return requests.get(url, timeout=REQUEST_TIMEOUT).json()
-    except:
-        return {}
+    if validar_cnpj(cnpj_digits):
+        cnpj_base_data = enrich_from_cnpj_base(cnpj_digits)
+        cnpjbiz_data = enrich_from_cnpjbiz(cnpj_digits)
 
-# =========================
-# FALLBACK INTELIGENTE
-# =========================
+    email_final = _first_non_empty(
+        website_info.get("email"),
+        cnpjbiz_data.get("cnpjbiz_email", "")
+    )
 
-def fallback_busca(nome, cidade):
-    query = f"{nome} {cidade}"
-    resultados = buscar_google_places(query)
+    whatsapp_final = _first_non_empty(
+        website_info.get("whatsapp"),
+        cnpjbiz_data.get("cnpjbiz_whatsapp", "")
+    )
 
-    if not resultados:
-        return None
+    telefone_final = _first_non_empty(
+        phone,
+        cnpjbiz_data.get("cnpjbiz_telefone", "")
+    )
 
-    return resultados[0]
+    foto_maps = _get_place_photo(place)
 
-# =========================
-# PROCESSAMENTO PRINCIPAL
-# =========================
+    lead = {
+        "id": _safe_get(place, "id", default=""),
+        "nome": _safe_get(place, "displayName", "text", default="") or "Sem nome",
+        "razao_social": _first_non_empty(
+            cnpj_base_data.get("razao_social", ""),
+            cnpjbiz_data.get("cnpjbiz_razao_social", "")
+        ),
+        "nome_fantasia": _first_non_empty(
+            cnpj_base_data.get("nome_fantasia", ""),
+            cnpjbiz_data.get("cnpjbiz_nome_fantasia", "")
+        ),
+        "endereco": _safe_get(place, "formattedAddress", default="") or "",
+        "endereco_curto": _safe_get(place, "shortFormattedAddress", default="") or "",
+        "cidade": cidade,
+        "telefone": telefone_final,
+        "whatsapp": whatsapp_final,
+        "email": email_final,
+        "instagram": website_info.get("instagram", ""),
+        "facebook": website_info.get("facebook", ""),
+        "site": website,
+        "google_maps_url": _safe_get(place, "googleMapsUri", default="") or "",
+        "rating": _safe_get(place, "rating", default=0) or 0,
+        "reviews": _safe_get(place, "userRatingCount", default=0) or 0,
+        "cnpj": cnpj_digits if validar_cnpj(cnpj_digits) else "",
+        "tipo_empresa": "",
+        "status_empresa": _safe_get(place, "businessStatus", default="") or "",
+        "palavra_chave": palavra_chave_principal,
+        "lead_score": 0,
+        "situacao_cadastral": _first_non_empty(
+            cnpj_base_data.get("situacao_cadastral", ""),
+            cnpjbiz_data.get("cnpjbiz_situacao_cadastral", "")
+        ),
+        "data_abertura": _first_non_empty(
+            cnpj_base_data.get("data_abertura", ""),
+            cnpjbiz_data.get("cnpjbiz_data_abertura", "")
+        ),
+        "cnae_principal": _first_non_empty(
+            cnpj_base_data.get("cnae_principal", ""),
+            cnpjbiz_data.get("cnpjbiz_cnae_principal", "")
+        ),
+        "porte": _first_non_empty(
+            cnpj_base_data.get("porte", ""),
+            cnpjbiz_data.get("cnpjbiz_porte", "")
+        ),
+        "natureza_juridica": _first_non_empty(
+            cnpj_base_data.get("natureza_juridica", ""),
+            cnpjbiz_data.get("cnpjbiz_natureza_juridica", "")
+        ),
+        "capital_social": _first_non_empty(
+            cnpj_base_data.get("capital_social", ""),
+            cnpjbiz_data.get("cnpjbiz_capital_social", "")
+        ),
+        "matriz_filial": _first_non_empty(
+            cnpj_base_data.get("matriz_filial", ""),
+            cnpjbiz_data.get("cnpjbiz_matriz_filial", "")
+        ),
+        "uf": cnpj_base_data.get("uf", ""),
+        "municipio": cnpj_base_data.get("municipio", ""),
+        "cnpjbiz_url": cnpjbiz_data.get("cnpjbiz_url", ""),
+        "foto_maps_url": foto_maps.get("foto_maps_url", ""),
+        "foto_maps_atribuicoes": foto_maps.get("foto_maps_atribuicoes", []),
+    }
 
-def buscar_leads(dados):
-    cidade = dados.get("cidade")
-    palavra = dados.get("palavra_chave_principal")
-    limite = dados.get("limite_resultados", 5)
+    lead["tipo_empresa"] = _classify_company(place, cnpj_base_data, cnpjbiz_data)
+    lead["lead_score"] = _calculate_score(lead)
 
-    query = f"{palavra} em {cidade}"
+    return lead
 
-    resultados = buscar_google_places(query)
 
-    leads = []
+def _city_matches(cidade_busca: str, endereco: str) -> bool:
+    if not cidade_busca or not endereco:
+        return True
 
-    for item in resultados[:limite]:
+    cidade_busca = cidade_busca.lower().strip()
+    endereco = endereco.lower()
 
-        nome = item.get("name")
-        endereco = item.get("formatted_address")
-        rating = item.get("rating", 0)
-        place_id = item.get("place_id")
+    return cidade_busca in endereco
 
-        detalhes = buscar_detalhes_place(place_id)
 
-        telefone = detalhes.get("formatted_phone_number")
-        site = detalhes.get("website")
+def _apply_filters(leads: List[Dict[str, Any]], filtros: Dict[str, Any]) -> List[Dict[str, Any]]:
+    filtrados = []
 
-        foto = montar_foto(item)
+    apenas_com_whatsapp = filtros.get("apenas_com_whatsapp", False)
+    apenas_com_instagram = filtros.get("apenas_com_instagram", False)
+    apenas_com_site = filtros.get("apenas_com_site", False)
+    apenas_com_email = filtros.get("apenas_com_email", False)
+    apenas_com_cnpj = filtros.get("apenas_com_cnpj", False)
+    tipo_empresa = filtros.get("tipo_empresa", "Todos")
+    avaliacao_minima = filtros.get("avaliacao_minima", 0)
 
-        descricao = " ".join(item.get("types", []))
+    for lead in leads:
+        if apenas_com_whatsapp and not lead.get("whatsapp"):
+            continue
+        if apenas_com_instagram and not lead.get("instagram"):
+            continue
+        if apenas_com_site and not lead.get("site"):
+            continue
+        if apenas_com_email and not lead.get("email"):
+            continue
+        if apenas_com_cnpj and not lead.get("cnpj"):
+            continue
+        if tipo_empresa and tipo_empresa != "Todos" and lead.get("tipo_empresa") != tipo_empresa:
+            continue
+        if float(lead.get("rating", 0) or 0) < float(avaliacao_minima or 0):
+            continue
 
-        # =========================
-        # TENTAR PEGAR CNPJ DO SITE
-        # =========================
-        cnpj = None
-        email = None
-        whatsapp = None
+        filtrados.append(lead)
 
-        if site:
-            try:
-                html = requests.get(site, timeout=10).text
-                cnpj_match = re.findall(r"\d{14}", html)
-                if cnpj_match:
-                    cnpj = cnpj_match[0]
+    return filtrados
 
-                email = extrair_email(html)
-                whatsapp = extrair_whatsapp(html)
 
-            except:
-                pass
+def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cidade = _normalize_text(payload.get("cidade", ""))
+    palavra_chave_principal = _normalize_text(payload.get("palavra_chave_principal", ""))
+    palavras_chave_extras = _normalize_text(payload.get("palavras_chave_extras", ""))
+    limite_resultados = int(payload.get("limite_resultados", 5))
+    filtros = payload.get("filtros", {}) or {}
 
-        # =========================
-        # ENRIQUECER COM CNPJ
-        # =========================
-        dados_cnpj = buscar_cnpj(cnpj) if cnpj else {}
+    if not cidade:
+        raise Exception("Cidade não informada.")
+    if not palavra_chave_principal:
+        raise Exception("Palavra-chave principal não informada.")
 
-        cnae = dados_cnpj.get("cnae_fiscal_descricao", "")
-        situacao = dados_cnpj.get("descricao_situacao_cadastral")
+    queries = _build_queries(cidade, palavra_chave_principal, palavras_chave_extras)
 
-        # =========================
-        # FALLBACK (SE FALTAR DADOS)
-        # =========================
-        if not telefone or not site:
-            fallback = fallback_busca(nome, cidade)
+    encontrados: List[Dict[str, Any]] = []
+    seen_ids = set()
+    seen_cnpj = set()
 
-            if fallback:
-                detalhes_fb = buscar_detalhes_place(fallback["place_id"])
+    for query in queries:
+        try:
+            places = _request_places(query=query, max_result_count=max(10, limite_resultados * 3))
+        except Exception:
+            continue
 
-                telefone = telefone or detalhes_fb.get("formatted_phone_number")
-                site = site or detalhes_fb.get("website")
+        for place in places:
+            place_id = _safe_get(place, "id", default="")
+            if not place_id or place_id in seen_ids:
+                continue
 
-        # =========================
-        # CLASSIFICAÇÃO
-        # =========================
-        tipo_empresa = classificar_empresa(nome, cnae, descricao)
+            lead = _maps_place_to_lead(place, cidade, palavra_chave_principal)
 
-        lead = {
-            "nome": nome,
-            "endereco": endereco,
-            "telefone": telefone,
-            "site": site,
-            "email": email,
-            "whatsapp": whatsapp,
-            "cnpj": cnpj,
-            "cnae": cnae,
-            "situacao_cadastral": situacao,
-            "tipo_empresa": tipo_empresa,
-            "rating": rating,
-            "foto": foto,
-        }
+            if not _city_matches(cidade, lead.get("endereco", "")):
+                continue
 
-        leads.append(lead)
+            seen_ids.add(place_id)
+
+            cnpj = lead.get("cnpj", "")
+            if cnpj and cnpj in seen_cnpj:
+                continue
+
+            if cnpj:
+                seen_cnpj.add(cnpj)
+
+            encontrados.append(lead)
+
+        time.sleep(0.3)
+
+        if len(encontrados) >= limite_resultados * 5:
+            break
+
+    encontrados = _apply_filters(encontrados, filtros)
+    encontrados.sort(
+        key=lambda x: (x.get("lead_score", 0), x.get("reviews", 0), x.get("rating", 0)),
+        reverse=True
+    )
+    encontrados = encontrados[:limite_resultados]
 
     return {
         "status": "ok",
         "cidade": cidade,
-        "total_leads": len(leads),
-        "leads": leads
+        "palavra_chave_principal": palavra_chave_principal,
+        "palavras_chave_extras": palavras_chave_extras,
+        "total_leads": len(encontrados),
+        "run_folder": f"online_{_slugify(cidade)}_{_slugify(palavra_chave_principal)}",
+        "nichos": [palavra_chave_principal] + ([x.strip() for x in palavras_chave_extras.split(",") if x.strip()] if palavras_chave_extras else []),
+        "leads": encontrados
     }
