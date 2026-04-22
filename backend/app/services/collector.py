@@ -1,15 +1,17 @@
 import os
 import re
-import json
-import math
 import time
 from typing import Any, Dict, List, Optional
 
 import requests
 
+from app.services.cnpjbiz_enricher import (
+    enrich_from_cnpj_base,
+    enrich_from_cnpjbiz,
+)
+
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY", "")
-
 PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
@@ -38,6 +40,10 @@ def _slugify(text: str) -> str:
     return text
 
 
+def _only_digits(value: str) -> str:
+    return re.sub(r"\D", "", value or "")
+
+
 def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
     queries = []
 
@@ -54,12 +60,10 @@ def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
             queries.append(f"{principal} {extra} em {cidade}")
             queries.append(f"{extra} em {cidade}")
 
-    # variações automáticas para melhorar resultado
     queries.append(f"{principal} {cidade}")
     queries.append(f"empresa de {principal} em {cidade}")
     queries.append(f"loja de {principal} em {cidade}")
 
-    # remove duplicadas preservando ordem
     final = []
     seen = set()
     for q in queries:
@@ -88,7 +92,7 @@ def _extract_facebook(text: str) -> str:
 def _extract_whatsapp(text: str) -> str:
     if not text:
         return ""
-    m = re.search(r"(https?://wa\.me/[0-9]+)", text, re.IGNORECASE)
+    m = re.search(r"(https?://wa\.me/\d+)", text, re.IGNORECASE)
     if m:
         return m.group(1)
 
@@ -171,9 +175,7 @@ def _enrich_from_website(website_url: str) -> Dict[str, Any]:
         resp = requests.get(
             website_url,
             timeout=15,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            }
+            headers={"User-Agent": "Mozilla/5.0"}
         )
         if resp.status_code >= 400:
             return info
@@ -192,52 +194,20 @@ def _enrich_from_website(website_url: str) -> Dict[str, Any]:
     return info
 
 
-def _classify_company(place: Dict[str, Any]) -> str:
+def _classify_company(place: Dict[str, Any], cnpj_base_data: Dict[str, Any]) -> str:
     primary_type = (_safe_get(place, "primaryType") or "").lower()
     primary_name = (_safe_get(place, "primaryTypeDisplayName", "text") or "").lower()
-    joined = f"{primary_type} {primary_name}"
+
+    cnae = (cnpj_base_data.get("cnae_principal") or "").lower()
+    joined = f"{primary_type} {primary_name} {cnae}"
 
     if any(x in joined for x in ["manufacturer", "fabric", "factory", "fabrica", "industria"]):
         return "Fabricante"
-    if any(x in joined for x in ["wholesaler", "distribution", "distributor", "atacado"]):
+    if any(x in joined for x in ["wholesale", "wholesaler", "distribution", "distributor", "atacado"]):
         return "Distribuidor"
+    if any(x in joined for x in ["retail", "comercio", "loja", "varejo"]):
+        return "Revendedor"
     return "Todos"
-
-
-def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_principal: str) -> Dict[str, Any]:
-    website = _safe_get(place, "websiteUri", default="") or ""
-    website_info = _enrich_from_website(website) if website else {}
-
-    phone = (
-        _safe_get(place, "nationalPhoneNumber")
-        or _safe_get(place, "internationalPhoneNumber")
-        or ""
-    )
-
-    lead = {
-        "id": _safe_get(place, "id", default=""),
-        "nome": _safe_get(place, "displayName", "text", default="") or "Sem nome",
-        "endereco": _safe_get(place, "formattedAddress", default="") or "",
-        "endereco_curto": _safe_get(place, "shortFormattedAddress", default="") or "",
-        "cidade": cidade,
-        "telefone": phone,
-        "whatsapp": website_info.get("whatsapp", ""),
-        "email": website_info.get("email", ""),
-        "instagram": website_info.get("instagram", ""),
-        "facebook": website_info.get("facebook", ""),
-        "site": website,
-        "google_maps_url": _safe_get(place, "googleMapsUri", default="") or "",
-        "rating": _safe_get(place, "rating", default=0) or 0,
-        "reviews": _safe_get(place, "userRatingCount", default=0) or 0,
-        "cnpj": website_info.get("cnpj", ""),
-        "tipo_empresa": _classify_company(place),
-        "status_empresa": _safe_get(place, "businessStatus", default="") or "",
-        "palavra_chave": palavra_chave_principal,
-        "lead_score": 0,
-    }
-
-    lead["lead_score"] = _calculate_score(lead)
-    return lead
 
 
 def _calculate_score(lead: Dict[str, Any]) -> int:
@@ -261,6 +231,97 @@ def _calculate_score(lead: Dict[str, Any]) -> int:
         score += 5
 
     return min(score, 100)
+
+
+def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_principal: str) -> Dict[str, Any]:
+    website = _safe_get(place, "websiteUri", default="") or ""
+    website_info = _enrich_from_website(website) if website else {}
+
+    phone = (
+        _safe_get(place, "nationalPhoneNumber")
+        or _safe_get(place, "internationalPhoneNumber")
+        or ""
+    )
+
+    cnpj = website_info.get("cnpj", "")
+    cnpj_digits = _only_digits(cnpj)
+
+    cnpj_base_data = {}
+    cnpjbiz_data = {}
+
+    if len(cnpj_digits) == 14:
+        cnpj_base_data = enrich_from_cnpj_base(cnpj_digits)
+        cnpjbiz_data = enrich_from_cnpjbiz(cnpj_digits)
+
+    email_final = (
+        website_info.get("email")
+        or cnpjbiz_data.get("cnpjbiz_email", "")
+        or ""
+    )
+
+    whatsapp_final = (
+        website_info.get("whatsapp")
+        or cnpjbiz_data.get("cnpjbiz_whatsapp", "")
+        or ""
+    )
+
+    telefone_final = (
+        phone
+        or cnpjbiz_data.get("cnpjbiz_telefone", "")
+        or ""
+    )
+
+    lead = {
+        "id": _safe_get(place, "id", default=""),
+        "nome": _safe_get(place, "displayName", "text", default="") or "Sem nome",
+        "razao_social": cnpj_base_data.get("razao_social", "") or cnpjbiz_data.get("cnpjbiz_razao_social", ""),
+        "nome_fantasia": cnpj_base_data.get("nome_fantasia", "") or cnpjbiz_data.get("cnpjbiz_nome_fantasia", ""),
+        "endereco": _safe_get(place, "formattedAddress", default="") or "",
+        "endereco_curto": _safe_get(place, "shortFormattedAddress", default="") or "",
+        "cidade": cidade,
+        "telefone": telefone_final,
+        "whatsapp": whatsapp_final,
+        "email": email_final,
+        "instagram": website_info.get("instagram", ""),
+        "facebook": website_info.get("facebook", ""),
+        "site": website,
+        "google_maps_url": _safe_get(place, "googleMapsUri", default="") or "",
+        "rating": _safe_get(place, "rating", default=0) or 0,
+        "reviews": _safe_get(place, "userRatingCount", default=0) or 0,
+        "cnpj": cnpj_digits,
+        "tipo_empresa": "",
+        "status_empresa": _safe_get(place, "businessStatus", default="") or "",
+        "palavra_chave": palavra_chave_principal,
+        "lead_score": 0,
+        "situacao_cadastral": cnpj_base_data.get("situacao_cadastral", "") or cnpjbiz_data.get("cnpjbiz_situacao_cadastral", ""),
+        "data_abertura": cnpj_base_data.get("data_abertura", ""),
+        "cnae_principal": cnpj_base_data.get("cnae_principal", "") or cnpjbiz_data.get("cnpjbiz_cnae_principal", ""),
+        "porte": cnpj_base_data.get("porte", ""),
+        "natureza_juridica": cnpj_base_data.get("natureza_juridica", ""),
+        "capital_social": cnpj_base_data.get("capital_social", "") or cnpjbiz_data.get("cnpjbiz_capital_social", ""),
+        "matriz_filial": cnpj_base_data.get("matriz_filial", ""),
+        "uf": cnpj_base_data.get("uf", ""),
+        "municipio": cnpj_base_data.get("municipio", ""),
+        "cnpjbiz_url": cnpjbiz_data.get("cnpjbiz_url", ""),
+    }
+
+    lead["tipo_empresa"] = _classify_company(place, cnpj_base_data)
+    lead["lead_score"] = _calculate_score(lead)
+
+    return lead
+
+
+def _city_matches(cidade_busca: str, endereco: str) -> bool:
+    """
+    Evita resultados fora da cidade real.
+    """
+    if not cidade_busca or not endereco:
+        return True
+
+    cidade_busca = cidade_busca.lower().strip()
+    endereco = endereco.lower()
+
+    return cidade_busca in endereco
 
 
 def _apply_filters(leads: List[Dict[str, Any]], filtros: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -311,11 +372,11 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     encontrados: List[Dict[str, Any]] = []
     seen_ids = set()
+    seen_cnpj = set()
 
-    # busca em múltiplas variações
     for query in queries:
         try:
-            places = _request_places(query=query, max_result_count=max(10, limite_resultados * 2))
+            places = _request_places(query=query, max_result_count=max(10, limite_resultados * 3))
         except Exception:
             continue
 
@@ -324,23 +385,32 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             if not place_id or place_id in seen_ids:
                 continue
 
-            seen_ids.add(place_id)
             lead = _maps_place_to_lead(place, cidade, palavra_chave_principal)
+
+            if not _city_matches(cidade, lead.get("endereco", "")):
+                continue
+
+            seen_ids.add(place_id)
+
+            cnpj = lead.get("cnpj", "")
+            if cnpj and cnpj in seen_cnpj:
+                continue
+
+            if cnpj:
+                seen_cnpj.add(cnpj)
+
             encontrados.append(lead)
 
-        # pequena pausa para não bater tudo de uma vez
         time.sleep(0.3)
 
-        if len(encontrados) >= limite_resultados * 4:
+        if len(encontrados) >= limite_resultados * 5:
             break
 
-    # aplica filtros
     encontrados = _apply_filters(encontrados, filtros)
-
-    # ordena melhor lead primeiro
-    encontrados.sort(key=lambda x: (x.get("lead_score", 0), x.get("reviews", 0), x.get("rating", 0)), reverse=True)
-
-    # corta no limite final
+    encontrados.sort(
+        key=lambda x: (x.get("lead_score", 0), x.get("reviews", 0), x.get("rating", 0)),
+        reverse=True
+    )
     encontrados = encontrados[:limite_resultados]
 
     return {
