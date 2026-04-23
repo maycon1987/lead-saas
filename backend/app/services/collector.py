@@ -69,7 +69,6 @@ def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
 
     queries.append(f"{principal} {cidade}")
     queries.append(f"empresa de {principal} em {cidade}")
-    queries.append(f"loja de {principal} em {cidade}")
 
     final = []
     seen = set()
@@ -117,6 +116,7 @@ def _extract_email(text: str) -> str:
 def _extract_cnpj(text: str) -> str:
     if not text:
         return ""
+
     matches = re.findall(r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}\-?\d{2}|\d{14})", text)
     for m in matches:
         digits = _only_digits(m)
@@ -147,7 +147,6 @@ def _request_places(query: str, max_result_count: int = 10) -> List[Dict[str, An
             "places.primaryTypeDisplayName",
             "places.location",
             "places.shortFormattedAddress",
-            "places.photos",
         ])
     }
 
@@ -206,38 +205,41 @@ def _enrich_from_website(website_url: str) -> Dict[str, Any]:
     return info
 
 
-def _get_place_photo(place: Dict[str, Any]) -> Dict[str, Any]:
-    result = {
-        "foto_maps_url": "",
-        "foto_maps_atribuicoes": [],
+def _buscar_cnpj_no_google(nome_empresa: str, cidade: str) -> str:
+    if not nome_empresa:
+        return ""
+
+    consultas = [
+        f"{nome_empresa} cnpj {cidade}",
+        f"{nome_empresa} cnpj",
+        f"site:cnpj.biz {nome_empresa}",
+        f"site:econodata.com.br {nome_empresa} {cidade}",
+        f"\"{nome_empresa}\" \"cnpj\"",
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
     }
 
-    photos = place.get("photos") or []
-    if not photos:
-        return result
+    for consulta in consultas:
+        try:
+            url = f"https://www.google.com/search?q={requests.utils.quote(consulta)}&hl=pt-BR"
+            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
 
-    first_photo = photos[0]
-    photo_name = first_photo.get("name", "")
-    author_attributions = first_photo.get("authorAttributions", []) or []
+            if resp.status_code >= 400:
+                continue
 
-    if not photo_name or not GOOGLE_API_KEY:
-        result["foto_maps_atribuicoes"] = author_attributions
-        return result
+            html = resp.text
+            cnpj = _extract_cnpj(html)
+            if cnpj and validar_cnpj(cnpj):
+                return cnpj
 
-    try:
-        photo_url = (
-            f"https://places.googleapis.com/v1/{photo_name}/media"
-            f"?key={GOOGLE_API_KEY}&maxWidthPx=600&skipHttpRedirect=true"
-        )
-        resp = requests.get(photo_url, timeout=REQUEST_TIMEOUT)
-        if resp.status_code < 400:
-            data = resp.json()
-            result["foto_maps_url"] = data.get("photoUri", "")
-            result["foto_maps_atribuicoes"] = author_attributions
-    except Exception:
-        pass
+        except Exception:
+            continue
 
-    return result
+        time.sleep(0.4)
+
+    return ""
 
 
 def _classify_company(place: Dict[str, Any], cnpj_base_data: Dict[str, Any], cnpjbiz_data: Dict[str, Any]) -> str:
@@ -251,13 +253,13 @@ def _classify_company(place: Dict[str, Any], cnpj_base_data: Dict[str, Any], cnp
 
     joined = f"{primary_type} {primary_name} {cnae}"
 
-    if any(x in joined for x in ["manufacturer", "fabric", "factory", "fabrica", "industria"]):
+    if any(x in joined for x in ["manufacturer", "fabric", "factory", "fabrica", "industria", "fabricação", "fabricacao"]):
         return "Fabricante"
-    if any(x in joined for x in ["wholesale", "wholesaler", "distribution", "distributor", "atacado"]):
+    if any(x in joined for x in ["wholesale", "wholesaler", "distribution", "distributor", "atacado", "atacadista"]):
         return "Distribuidor"
-    if any(x in joined for x in ["import", "importacao", "importação"]):
+    if any(x in joined for x in ["import", "importacao", "importação", "importador"]):
         return "Importador"
-    if any(x in joined for x in ["retail", "comercio", "loja", "varejo"]):
+    if any(x in joined for x in ["retail", "comercio", "loja", "varejo", "revenda", "revendedor"]):
         return "Revendedor"
     return "Todos"
 
@@ -287,6 +289,8 @@ def _calculate_score(lead: Dict[str, Any]) -> int:
 
 def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_principal: str) -> Dict[str, Any]:
     website = _safe_get(place, "websiteUri", default="") or ""
+    nome_empresa = _safe_get(place, "displayName", "text", default="") or ""
+
     website_info = _enrich_from_website(website) if website else {}
 
     phone = (
@@ -297,6 +301,11 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
 
     cnpj = website_info.get("cnpj", "")
     cnpj_digits = _only_digits(cnpj) if cnpj else ""
+
+    if not validar_cnpj(cnpj_digits):
+        cnpj_google = _buscar_cnpj_no_google(nome_empresa, cidade)
+        if validar_cnpj(cnpj_google):
+            cnpj_digits = cnpj_google
 
     cnpj_base_data = {}
     cnpjbiz_data = {}
@@ -320,11 +329,9 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         cnpjbiz_data.get("cnpjbiz_telefone", "")
     )
 
-    foto_maps = _get_place_photo(place)
-
     lead = {
         "id": _safe_get(place, "id", default=""),
-        "nome": _safe_get(place, "displayName", "text", default="") or "Sem nome",
+        "nome": nome_empresa or "Sem nome",
         "razao_social": _first_non_empty(
             cnpj_base_data.get("razao_social", ""),
             cnpjbiz_data.get("cnpjbiz_razao_social", "")
@@ -381,8 +388,8 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         "uf": cnpj_base_data.get("uf", ""),
         "municipio": cnpj_base_data.get("municipio", ""),
         "cnpjbiz_url": cnpjbiz_data.get("cnpjbiz_url", ""),
-        "foto_maps_url": foto_maps.get("foto_maps_url", ""),
-        "foto_maps_atribuicoes": foto_maps.get("foto_maps_atribuicoes", []),
+        "foto_maps_url": "",
+        "foto_maps_atribuicoes": [],
     }
 
     lead["tipo_empresa"] = _classify_company(place, cnpj_base_data, cnpjbiz_data)
