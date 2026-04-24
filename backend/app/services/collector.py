@@ -12,6 +12,7 @@ from app.services.cnpjbiz_enricher import (
 )
 
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY", "")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "")
 PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
@@ -51,6 +52,53 @@ def _first_non_empty(*values):
     return ""
 
 
+def _extract_cnpj(text: str) -> str:
+    if not text:
+        return ""
+
+    matches = re.findall(r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}\-?\d{2}|\d{14})", text)
+
+    for item in matches:
+        digits = _only_digits(item)
+        if validar_cnpj(digits):
+            return digits
+
+    return ""
+
+
+def _extract_email(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", text)
+    return m.group(1) if m else ""
+
+
+def _extract_instagram(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(https?://(?:www\.)?instagram\.com/[A-Za-z0-9._\-/?=&]+)", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _extract_facebook(text: str) -> str:
+    if not text:
+        return ""
+    m = re.search(r"(https?://(?:www\.)?facebook\.com/[A-Za-z0-9._\-/?=&]+)", text, re.IGNORECASE)
+    return m.group(1) if m else ""
+
+
+def _extract_whatsapp(text: str) -> str:
+    if not text:
+        return ""
+
+    m = re.search(r"(https?://wa\.me/\d+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+
+    m2 = re.search(r"(\+?55\s?\(?\d{2}\)?\s?\d{4,5}\-?\d{4})", text)
+    return m2.group(1) if m2 else ""
+
+
 def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
     queries = []
 
@@ -73,6 +121,7 @@ def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
 
     final = []
     seen = set()
+
     for q in queries:
         key = q.lower()
         if key not in seen:
@@ -80,50 +129,6 @@ def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
             final.append(q)
 
     return final
-
-
-def _extract_instagram(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"(https?://(?:www\.)?instagram\.com/[A-Za-z0-9._\-/?=&]+)", text, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-def _extract_facebook(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"(https?://(?:www\.)?facebook\.com/[A-Za-z0-9._\-/?=&]+)", text, re.IGNORECASE)
-    return m.group(1) if m else ""
-
-
-def _extract_whatsapp(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"(https?://wa\.me/\d+)", text, re.IGNORECASE)
-    if m:
-        return m.group(1)
-
-    m2 = re.search(r"(\+?55\s?\(?\d{2}\)?\s?\d{4,5}\-?\d{4})", text)
-    return m2.group(1) if m2 else ""
-
-
-def _extract_email(text: str) -> str:
-    if not text:
-        return ""
-    m = re.search(r"([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", text)
-    return m.group(1) if m else ""
-
-
-def _extract_cnpj(text: str) -> str:
-    if not text:
-        return ""
-
-    matches = re.findall(r"(\d{2}\.?\d{3}\.?\d{3}/?\d{4}\-?\d{2}|\d{14})", text)
-    for m in matches:
-        digits = _only_digits(m)
-        if validar_cnpj(digits):
-            return digits
-    return ""
 
 
 def _request_places(query: str, max_result_count: int = 10) -> List[Dict[str, Any]]:
@@ -190,6 +195,7 @@ def _enrich_from_website(website_url: str) -> Dict[str, Any]:
             timeout=15,
             headers={"User-Agent": "Mozilla/5.0"}
         )
+
         if resp.status_code >= 400:
             return info
 
@@ -207,44 +213,79 @@ def _enrich_from_website(website_url: str) -> Dict[str, Any]:
     return info
 
 
-def _buscar_cnpj_no_google(nome_empresa: str, cidade: str) -> str:
+def _buscar_cnpj_com_serper(nome_empresa: str, cidade: str) -> str:
     """
-    Fallback:
-    quando o site não traz CNPJ, tenta achar em resultados do Google
-    usando nome da empresa + cidade + cnpj.
+    Busca CNPJ em resultados do Google via Serper.
+    Melhor do que tentar raspar google.com diretamente.
     """
-    if not nome_empresa:
+    if not SERPER_API_KEY or not nome_empresa:
         return ""
 
     consultas = [
         f"{nome_empresa} cnpj {cidade}",
         f"{nome_empresa} cnpj",
+        f"{nome_empresa} razão social cnpj {cidade}",
         f"site:cnpj.biz {nome_empresa}",
         f"site:econodata.com.br {nome_empresa} {cidade}",
-        f"\"{nome_empresa}\" \"cnpj\"",
+        f"site:casadosdados.com.br {nome_empresa} {cidade}",
+        f"\"{nome_empresa}\" \"CNPJ\"",
     ]
 
     headers = {
-        "User-Agent": "Mozilla/5.0"
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json",
     }
 
     for consulta in consultas:
         try:
-            url = f"https://www.google.com/search?q={requests.utils.quote(consulta)}&hl=pt-BR"
-            resp = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            resp = requests.post(
+                "https://google.serper.dev/search",
+                headers=headers,
+                json={
+                    "q": consulta,
+                    "gl": "br",
+                    "hl": "pt-br",
+                    "num": 10,
+                },
+                timeout=REQUEST_TIMEOUT
+            )
 
             if resp.status_code >= 400:
                 continue
 
-            html = resp.text
-            cnpj = _extract_cnpj(html)
+            data = resp.json()
+
+            textos = []
+
+            # resposta orgânica
+            for item in data.get("organic", []) or []:
+                textos.append(item.get("title", ""))
+                textos.append(item.get("snippet", ""))
+                textos.append(item.get("link", ""))
+
+            # resposta enriquecida / answer box
+            answer_box = data.get("answerBox") or {}
+            if isinstance(answer_box, dict):
+                textos.append(answer_box.get("title", ""))
+                textos.append(answer_box.get("answer", ""))
+                textos.append(answer_box.get("snippet", ""))
+
+            # knowledge graph
+            knowledge = data.get("knowledgeGraph") or {}
+            if isinstance(knowledge, dict):
+                textos.append(knowledge.get("title", ""))
+                textos.append(knowledge.get("description", ""))
+
+            texto_total = "\n".join([t for t in textos if t])
+            cnpj = _extract_cnpj(texto_total)
+
             if cnpj and validar_cnpj(cnpj):
                 return cnpj
 
         except Exception:
-            continue
+            pass
 
-        time.sleep(0.4)
+        time.sleep(0.3)
 
     return ""
 
@@ -272,11 +313,14 @@ def _get_place_photo(place: Dict[str, Any]) -> Dict[str, Any]:
             f"https://places.googleapis.com/v1/{photo_name}/media"
             f"?key={GOOGLE_API_KEY}&maxWidthPx=600&skipHttpRedirect=true"
         )
+
         resp = requests.get(photo_url, timeout=REQUEST_TIMEOUT)
+
         if resp.status_code < 400:
             data = resp.json()
             result["foto_maps_url"] = data.get("photoUri", "")
             result["foto_maps_atribuicoes"] = author_attributions
+
     except Exception:
         pass
 
@@ -294,14 +338,18 @@ def _classify_company(place: Dict[str, Any], cnpj_base_data: Dict[str, Any], cnp
 
     joined = f"{primary_type} {primary_name} {cnae}"
 
-    if any(x in joined for x in ["manufacturer", "fabric", "factory", "fabrica", "industria", "fabricação", "fabricacao"]):
+    if any(x in joined for x in ["fabricação", "fabricacao", "fabricante", "industria", "indústria", "factory", "manufacturer"]):
         return "Fabricante"
-    if any(x in joined for x in ["wholesale", "wholesaler", "distribution", "distributor", "atacado", "atacadista"]):
+
+    if any(x in joined for x in ["atacado", "atacadista", "distribuidor", "distribuidora", "distribution", "wholesale"]):
         return "Distribuidor"
-    if any(x in joined for x in ["import", "importacao", "importação", "importador"]):
+
+    if any(x in joined for x in ["importador", "importadora", "importação", "importacao", "import"]):
         return "Importador"
-    if any(x in joined for x in ["retail", "comercio", "loja", "varejo", "revenda", "revendedor"]):
+
+    if any(x in joined for x in ["varejo", "revenda", "revendedor", "comércio varejista", "comercio varejista", "loja", "retail"]):
         return "Revendedor"
+
     return "Todos"
 
 
@@ -329,8 +377,8 @@ def _calculate_score(lead: Dict[str, Any]) -> int:
 
 
 def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_principal: str) -> Dict[str, Any]:
+    nome_empresa = _safe_get(place, "displayName", "text", default="") or "Sem nome"
     website = _safe_get(place, "websiteUri", default="") or ""
-    nome_empresa = _safe_get(place, "displayName", "text", default="") or ""
 
     website_info = _enrich_from_website(website) if website else {}
 
@@ -340,14 +388,13 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         or ""
     )
 
-    cnpj = website_info.get("cnpj", "")
-    cnpj_digits = _only_digits(cnpj) if cnpj else ""
+    cnpj_digits = _only_digits(website_info.get("cnpj", ""))
 
-    # novo fallback: se não achou CNPJ no site, tenta no Google
+    # fallback profissional: se o site não trouxe CNPJ, procura via Serper
     if not validar_cnpj(cnpj_digits):
-        cnpj_google = _buscar_cnpj_no_google(nome_empresa, cidade)
-        if validar_cnpj(cnpj_google):
-            cnpj_digits = cnpj_google
+        cnpj_serper = _buscar_cnpj_com_serper(nome_empresa, cidade)
+        if validar_cnpj(cnpj_serper):
+            cnpj_digits = cnpj_serper
 
     cnpj_base_data = {}
     cnpjbiz_data = {}
@@ -375,7 +422,7 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
 
     lead = {
         "id": _safe_get(place, "id", default=""),
-        "nome": nome_empresa or "Sem nome",
+        "nome": nome_empresa,
         "razao_social": _first_non_empty(
             cnpj_base_data.get("razao_social", ""),
             cnpjbiz_data.get("cnpjbiz_razao_social", "")
@@ -401,6 +448,7 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         "status_empresa": _safe_get(place, "businessStatus", default="") or "",
         "palavra_chave": palavra_chave_principal,
         "lead_score": 0,
+
         "situacao_cadastral": _first_non_empty(
             cnpj_base_data.get("situacao_cadastral", ""),
             cnpjbiz_data.get("cnpjbiz_situacao_cadastral", "")
@@ -432,6 +480,7 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         "uf": cnpj_base_data.get("uf", ""),
         "municipio": cnpj_base_data.get("municipio", ""),
         "cnpjbiz_url": cnpjbiz_data.get("cnpjbiz_url", ""),
+
         "foto_maps_url": foto_maps.get("foto_maps_url", ""),
         "foto_maps_atribuicoes": foto_maps.get("foto_maps_atribuicoes", []),
     }
@@ -535,10 +584,12 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             break
 
     encontrados = _apply_filters(encontrados, filtros)
+
     encontrados.sort(
         key=lambda x: (x.get("lead_score", 0), x.get("reviews", 0), x.get("rating", 0)),
         reverse=True
     )
+
     encontrados = encontrados[:limite_resultados]
 
     return {
