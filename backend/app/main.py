@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Optional, Any, Dict
 
 from app.services.collector import run_search
 
-app = FastAPI(title="Buscador de Leads", version="2.0.0")
+
+app = FastAPI(title="Buscador de Leads", version="2.2.0")
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,6 +19,8 @@ app.add_middleware(
 
 
 class FiltrosBusca(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     apenas_com_whatsapp: bool = False
     apenas_com_instagram: bool = False
     apenas_com_site: bool = False
@@ -27,11 +31,32 @@ class FiltrosBusca(BaseModel):
 
 
 class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    estado: Optional[str] = ""
     cidade: str = Field(..., min_length=2)
     palavra_chave_principal: str = Field(..., min_length=2)
     palavras_chave_extras: Optional[str] = ""
-    limite_resultados: int = 5
-    filtros: FiltrosBusca
+    limite_resultados: Optional[int] = 10
+
+    # Pode vir do frontend como rapida/completa
+    modo_busca: Optional[str] = "rapida"
+
+    # Opções selecionadas no frontend
+    buscar_whatsapp: Optional[bool] = False
+    buscar_site: Optional[bool] = False
+    buscar_telefone: Optional[bool] = False
+    buscar_email: Optional[bool] = False
+    buscar_instagram: Optional[bool] = False
+    buscar_facebook: Optional[bool] = False
+
+    buscar_cnpj: Optional[bool] = False
+    buscar_cnae: Optional[bool] = False
+    buscar_capital_social: Optional[bool] = False
+    buscar_natureza_juridica: Optional[bool] = False
+    buscar_situacao_cadastral: Optional[bool] = False
+
+    filtros: FiltrosBusca = FiltrosBusca()
 
 
 @app.get("/")
@@ -47,7 +72,8 @@ def health():
 @app.post("/searches")
 def create_search(payload: SearchRequest):
     try:
-        resultado = run_search(payload.model_dump())
+        payload_dict: Dict[str, Any] = payload.model_dump()
+        resultado = run_search(payload_dict)
         return resultado
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
