@@ -4,7 +4,6 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
-from supabase import create_client, Client
 
 from app.services.cnpjbiz_enricher import (
     enrich_from_cnpj_base,
@@ -15,16 +14,6 @@ from app.services.cnpjbiz_enricher import (
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_PLACES_API_KEY", "")
 PLACES_TEXT_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText"
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
-supabase: Optional[Client] = None
-if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception:
-        supabase = None
 
 
 def _safe_get(d: Dict[str, Any], *keys, default=None):
@@ -80,6 +69,7 @@ def _build_queries(cidade: str, principal: str, extras: str) -> List[str]:
 
     queries.append(f"{principal} {cidade}")
     queries.append(f"empresa de {principal} em {cidade}")
+    queries.append(f"loja de {principal} em {cidade}")
 
     final = []
     seen = set()
@@ -158,6 +148,7 @@ def _request_places(query: str, max_result_count: int = 10) -> List[Dict[str, An
             "places.primaryTypeDisplayName",
             "places.location",
             "places.shortFormattedAddress",
+            "places.photos",
         ])
     }
 
@@ -217,6 +208,11 @@ def _enrich_from_website(website_url: str) -> Dict[str, Any]:
 
 
 def _buscar_cnpj_no_google(nome_empresa: str, cidade: str) -> str:
+    """
+    Fallback:
+    quando o site não traz CNPJ, tenta achar em resultados do Google
+    usando nome da empresa + cidade + cnpj.
+    """
     if not nome_empresa:
         return ""
 
@@ -251,6 +247,40 @@ def _buscar_cnpj_no_google(nome_empresa: str, cidade: str) -> str:
         time.sleep(0.4)
 
     return ""
+
+
+def _get_place_photo(place: Dict[str, Any]) -> Dict[str, Any]:
+    result = {
+        "foto_maps_url": "",
+        "foto_maps_atribuicoes": [],
+    }
+
+    photos = place.get("photos") or []
+    if not photos:
+        return result
+
+    first_photo = photos[0]
+    photo_name = first_photo.get("name", "")
+    author_attributions = first_photo.get("authorAttributions", []) or []
+
+    if not photo_name or not GOOGLE_API_KEY:
+        result["foto_maps_atribuicoes"] = author_attributions
+        return result
+
+    try:
+        photo_url = (
+            f"https://places.googleapis.com/v1/{photo_name}/media"
+            f"?key={GOOGLE_API_KEY}&maxWidthPx=600&skipHttpRedirect=true"
+        )
+        resp = requests.get(photo_url, timeout=REQUEST_TIMEOUT)
+        if resp.status_code < 400:
+            data = resp.json()
+            result["foto_maps_url"] = data.get("photoUri", "")
+            result["foto_maps_atribuicoes"] = author_attributions
+    except Exception:
+        pass
+
+    return result
 
 
 def _classify_company(place: Dict[str, Any], cnpj_base_data: Dict[str, Any], cnpjbiz_data: Dict[str, Any]) -> str:
@@ -313,6 +343,7 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
     cnpj = website_info.get("cnpj", "")
     cnpj_digits = _only_digits(cnpj) if cnpj else ""
 
+    # novo fallback: se não achou CNPJ no site, tenta no Google
     if not validar_cnpj(cnpj_digits):
         cnpj_google = _buscar_cnpj_no_google(nome_empresa, cidade)
         if validar_cnpj(cnpj_google):
@@ -340,8 +371,10 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         cnpjbiz_data.get("cnpjbiz_telefone", "")
     )
 
+    foto_maps = _get_place_photo(place)
+
     lead = {
-        "place_id": _safe_get(place, "id", default=""),
+        "id": _safe_get(place, "id", default=""),
         "nome": nome_empresa or "Sem nome",
         "razao_social": _first_non_empty(
             cnpj_base_data.get("razao_social", ""),
@@ -352,6 +385,7 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
             cnpjbiz_data.get("cnpjbiz_nome_fantasia", "")
         ),
         "endereco": _safe_get(place, "formattedAddress", default="") or "",
+        "endereco_curto": _safe_get(place, "shortFormattedAddress", default="") or "",
         "cidade": cidade,
         "telefone": telefone_final,
         "whatsapp": whatsapp_final,
@@ -364,6 +398,9 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
         "reviews": _safe_get(place, "userRatingCount", default=0) or 0,
         "cnpj": cnpj_digits if validar_cnpj(cnpj_digits) else "",
         "tipo_empresa": "",
+        "status_empresa": _safe_get(place, "businessStatus", default="") or "",
+        "palavra_chave": palavra_chave_principal,
+        "lead_score": 0,
         "situacao_cadastral": _first_non_empty(
             cnpj_base_data.get("situacao_cadastral", ""),
             cnpjbiz_data.get("cnpjbiz_situacao_cadastral", "")
@@ -393,9 +430,10 @@ def _maps_place_to_lead(place: Dict[str, Any], cidade: str, palavra_chave_princi
             cnpjbiz_data.get("cnpjbiz_matriz_filial", "")
         ),
         "uf": cnpj_base_data.get("uf", ""),
+        "municipio": cnpj_base_data.get("municipio", ""),
         "cnpjbiz_url": cnpjbiz_data.get("cnpjbiz_url", ""),
-        "lead_score": 0,
-        "status_empresa": _safe_get(place, "businessStatus", default="") or "",
+        "foto_maps_url": foto_maps.get("foto_maps_url", ""),
+        "foto_maps_atribuicoes": foto_maps.get("foto_maps_atribuicoes", []),
     }
 
     lead["tipo_empresa"] = _classify_company(place, cnpj_base_data, cnpjbiz_data)
@@ -446,77 +484,6 @@ def _apply_filters(leads: List[Dict[str, Any]], filtros: Dict[str, Any]) -> List
     return filtrados
 
 
-def _save_search_run(cidade: str, palavra_chave_principal: str, palavras_chave_extras: str, limite_resultados: int, total_encontrado: int) -> Optional[str]:
-    if not supabase:
-        return None
-
-    try:
-        result = supabase.table("search_runs").insert({
-            "cidade": cidade,
-            "palavra_chave_principal": palavra_chave_principal,
-            "palavras_chave_extras": palavras_chave_extras,
-            "limite_resultados": limite_resultados,
-            "total_encontrado": total_encontrado,
-            "status": "ok",
-        }).execute()
-
-        if result.data and len(result.data) > 0:
-            return result.data[0]["id"]
-    except Exception as e:
-        print("Erro ao salvar search_run:", e)
-
-    return None
-
-
-def _upsert_lead(lead: Dict[str, Any]) -> Optional[str]:
-    if not supabase:
-        return None
-
-    try:
-        cnpj = lead.get("cnpj", "")
-        place_id = lead.get("place_id", "")
-
-        existing = None
-
-        if cnpj:
-            existing_result = supabase.table("leads").select("id").eq("cnpj", cnpj).limit(1).execute()
-            if existing_result.data:
-                existing = existing_result.data[0]
-
-        if not existing and place_id:
-            existing_result = supabase.table("leads").select("id").eq("place_id", place_id).limit(1).execute()
-            if existing_result.data:
-                existing = existing_result.data[0]
-
-        if existing:
-            lead_id = existing["id"]
-            supabase.table("leads").update(lead).eq("id", lead_id).execute()
-            return lead_id
-
-        insert_result = supabase.table("leads").insert(lead).execute()
-        if insert_result.data and len(insert_result.data) > 0:
-            return insert_result.data[0]["id"]
-
-    except Exception as e:
-        print("Erro ao salvar lead:", e)
-
-    return None
-
-
-def _save_search_run_lead(search_run_id: str, lead_id: str, palavra_chave_usada: str) -> None:
-    if not supabase or not search_run_id or not lead_id:
-        return
-
-    try:
-        supabase.table("search_run_leads").insert({
-            "search_run_id": search_run_id,
-            "lead_id": lead_id,
-            "palavra_chave_usada": palavra_chave_usada,
-        }).execute()
-    except Exception as e:
-        print("Erro ao salvar search_run_lead:", e)
-
-
 def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     cidade = _normalize_text(payload.get("cidade", ""))
     palavra_chave_principal = _normalize_text(payload.get("palavra_chave_principal", ""))
@@ -532,8 +499,8 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     queries = _build_queries(cidade, palavra_chave_principal, palavras_chave_extras)
 
     encontrados: List[Dict[str, Any]] = []
-    seen_place_ids = set()
-    seen_cnpjs = set()
+    seen_ids = set()
+    seen_cnpj = set()
 
     for query in queries:
         try:
@@ -543,7 +510,7 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         for place in places:
             place_id = _safe_get(place, "id", default="")
-            if not place_id or place_id in seen_place_ids:
+            if not place_id or place_id in seen_ids:
                 continue
 
             lead = _maps_place_to_lead(place, cidade, palavra_chave_principal)
@@ -551,14 +518,14 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
             if not _city_matches(cidade, lead.get("endereco", "")):
                 continue
 
-            seen_place_ids.add(place_id)
+            seen_ids.add(place_id)
 
             cnpj = lead.get("cnpj", "")
-            if cnpj and cnpj in seen_cnpjs:
+            if cnpj and cnpj in seen_cnpj:
                 continue
 
             if cnpj:
-                seen_cnpjs.add(cnpj)
+                seen_cnpj.add(cnpj)
 
             encontrados.append(lead)
 
@@ -573,19 +540,6 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         reverse=True
     )
     encontrados = encontrados[:limite_resultados]
-
-    search_run_id = _save_search_run(
-        cidade=cidade,
-        palavra_chave_principal=palavra_chave_principal,
-        palavras_chave_extras=palavras_chave_extras,
-        limite_resultados=limite_resultados,
-        total_encontrado=len(encontrados),
-    )
-
-    for lead in encontrados:
-        lead_id = _upsert_lead(lead)
-        if lead_id and search_run_id:
-            _save_search_run_lead(search_run_id, lead_id, palavra_chave_principal)
 
     return {
         "status": "ok",
