@@ -4,9 +4,10 @@ from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, Any, Dict
 
 from app.services.collector import run_search
+from app.routes.videos import router as videos_router
 
 
-app = FastAPI(title="Buscador de Leads", version="2.2.0")
+app = FastAPI(title="Buscador de Leads", version="2.3.0")
 
 
 app.add_middleware(
@@ -16,6 +17,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ROTAS DE VÍDEOS
+app.include_router(videos_router)
 
 
 class FiltrosBusca(BaseModel):
@@ -39,10 +44,8 @@ class SearchRequest(BaseModel):
     palavras_chave_extras: Optional[str] = ""
     limite_resultados: Optional[int] = 10
 
-    # Pode vir do frontend como rapida/completa
     modo_busca: Optional[str] = "rapida"
 
-    # Opções selecionadas no frontend
     buscar_whatsapp: Optional[bool] = False
     buscar_site: Optional[bool] = False
     buscar_telefone: Optional[bool] = False
