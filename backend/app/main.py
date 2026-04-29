@@ -9,7 +9,6 @@ from app.routes.videos import router as videos_router
 
 app = FastAPI(title="Buscador de Leads", version="2.3.0")
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,8 +17,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ROTAS DE VÍDEOS
 app.include_router(videos_router)
 
 
